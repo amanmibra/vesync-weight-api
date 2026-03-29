@@ -1,7 +1,7 @@
 import hashlib
-import math
 import os
 import time
+import uuid
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -13,77 +13,91 @@ VESYNC_PASSWORD = os.environ.get("VESYNC_PASSWORD")
 VESYNC_TIMEZONE = os.environ.get("VESYNC_TIMEZONE", "America/Los_Angeles")
 
 API_BASE = "https://smartapi.vesync.com"
+APP_VERSION = "5.6.60"
+APP_ID = "eldodkfj"
+TERMINAL_ID = str(uuid.uuid4())
+
+HEADERS = {
+    "User-Agent": "okhttp/3.12.1",
+    "Content-Type": "application/json; charset=UTF-8",
+}
+
+
+def _base_body(method: str) -> dict:
+    return {
+        "acceptLanguage": "en",
+        "accountID": "",
+        "appID": APP_ID,
+        "sourceAppID": APP_ID,
+        "clientInfo": "pyvesync",
+        "clientType": "vesyncApp",
+        "clientVersion": f"VeSync {APP_VERSION}",
+        "debugMode": False,
+        "method": method,
+        "osInfo": "Android",
+        "terminalId": TERMINAL_ID,
+        "timeZone": VESYNC_TIMEZONE,
+        "token": "",
+        "traceId": str(int(time.time())),
+        "userCountryCode": "US",
+    }
 
 
 def vesync_login() -> dict:
-    password_md5 = hashlib.md5(VESYNC_PASSWORD.encode()).hexdigest()
-    body = {
-        "acceptLanguage": "en",
-        "appVersion": "2.8.6",
-        "phoneBrand": "api",
-        "phoneOS": "api",
-        "timeZone": VESYNC_TIMEZONE,
-        "traceId": str(int(time.time())),
-        "email": VESYNC_EMAIL,
-        "password": password_md5,
-        "devToken": "",
-        "userType": "1",
-        "method": "loginV2",
-    }
-    resp = requests.post(f"{API_BASE}/cloud/v2/user/login", json=body, timeout=15)
+    password_md5 = hashlib.md5(VESYNC_PASSWORD.encode("utf-8")).hexdigest()
+
+    # Step 1: Get authorization code
+    body = _base_body("authByPWDOrOTM")
+    body["authProtocolType"] = "generic"
+    body["email"] = VESYNC_EMAIL
+    body["password"] = password_md5
+
+    resp = requests.post(
+        f"{API_BASE}/globalPlatform/api/accountAuth/v1/authByPWDOrOTM",
+        json=body, headers=HEADERS, timeout=15,
+    )
     data = resp.json()
     if data.get("code") != 0:
         return None
-    result = data.get("result", {})
+
+    auth_code = data.get("result", {}).get("authorizeCode")
+    if not auth_code:
+        return None
+
+    # Step 2: Exchange auth code for token
+    body2 = _base_body("loginByAuthorizeCode4Vesync")
+    body2["authorizeCode"] = auth_code
+    body2["emailSubscriptions"] = False
+
+    resp2 = requests.post(
+        f"{API_BASE}/user/api/accountManage/v1/loginByAuthorizeCode4Vesync",
+        json=body2, headers=HEADERS, timeout=15,
+    )
+    data2 = resp2.json()
+    if data2.get("code") != 0:
+        return None
+
+    result = data2.get("result", {})
     return {"token": result.get("token"), "accountID": result.get("accountID")}
-
-
-def get_scale_devices(token: str, account_id: str) -> list:
-    body = {
-        "acceptLanguage": "en",
-        "appVersion": "2.8.6",
-        "phoneBrand": "api",
-        "phoneOS": "api",
-        "timeZone": VESYNC_TIMEZONE,
-        "traceId": str(int(time.time())),
-        "token": token,
-        "accountID": account_id,
-        "method": "devices",
-        "pageNo": 1,
-        "pageSize": 100,
-    }
-    resp = requests.post(f"{API_BASE}/cloud/v2/deviceManaged/devices", json=body, timeout=15)
-    data = resp.json()
-    devices = data.get("result", {}).get("list", [])
-    return [d for d in devices if "scale" in d.get("deviceType", "").lower()
-            or "scale" in d.get("configModule", "").lower()
-            or "scale" in d.get("type", "").lower()]
 
 
 def get_weight_data(token: str, account_id: str) -> list:
     """Try the fat scale endpoint first, then fall back to basic scale endpoint."""
     now = int(time.time())
-    headers = {"tk": token, "accountid": account_id}
+    auth_headers = {**HEADERS, "tk": token, "accountid": account_id}
 
     # Try fat scale endpoint (ESF00+ / body composition scales)
-    body = {
-        "acceptLanguage": "en",
-        "appVersion": "2.8.6",
-        "phoneBrand": "api",
-        "phoneOS": "api",
-        "timeZone": VESYNC_TIMEZONE,
-        "traceId": str(now),
-        "token": token,
-        "accountID": account_id,
-        "method": "getWeighData",
-        "startTime": 0,
-        "endTime": now,
-        "pageSize": 5,
-        "order": "desc",
-    }
+    body = _base_body("getWeighData")
+    body["token"] = token
+    body["accountID"] = account_id
+    body["startTime"] = 0
+    body["endTime"] = now
+    body["pageSize"] = 5
+    body["order"] = "desc"
+
     resp = requests.post(
         f"{API_BASE}/cloud/v1/deviceManaged/fatScale/getWeighData",
-        json=body, headers=headers, timeout=15,
+        json=body, headers=auth_headers, timeout=15,
     )
     data = resp.json()
     records = data.get("result", {}).get("data", [])
@@ -94,7 +108,7 @@ def get_weight_data(token: str, account_id: str) -> list:
     body["method"] = "getWeighingDataV2"
     resp = requests.post(
         f"{API_BASE}/cloud/v2/deviceManaged/getWeighingDataV2",
-        json=body, headers=headers, timeout=15,
+        json=body, headers=auth_headers, timeout=15,
     )
     data = resp.json()
     return data.get("result", {}).get("weightDatas", [])
