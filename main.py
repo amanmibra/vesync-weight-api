@@ -1,198 +1,175 @@
-import hashlib
 import os
 import time
-import uuid
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse
 
-app = FastAPI(title="VeSync Weight API")
+app = FastAPI(title="Withings Weight API")
 
-VESYNC_EMAIL = os.environ.get("VESYNC_EMAIL")
-VESYNC_PASSWORD = os.environ.get("VESYNC_PASSWORD")
-VESYNC_TIMEZONE = os.environ.get("VESYNC_TIMEZONE", "America/Los_Angeles")
+CLIENT_ID = os.environ.get("WITHINGS_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("WITHINGS_CLIENT_SECRET", "")
+REDIRECT_URI = os.environ.get("WITHINGS_REDIRECT_URI", "")
 
-API_BASE = "https://smartapi.vesync.com"
-APP_VERSION = "5.6.60"
-APP_ID = "eldodkfj"
-TERMINAL_ID = str(uuid.uuid4())
+WITHINGS_AUTH_URL = "https://account.withings.com/oauth2_user/authorize2"
+WITHINGS_TOKEN_URL = "https://wbsapi.withings.net/v2/oauth2"
+WITHINGS_MEASURE_URL = "https://wbsapi.withings.net/measure"
 
-HEADERS = {
-    "User-Agent": "okhttp/3.12.1",
-    "Content-Type": "application/json; charset=UTF-8",
+# Measurement type IDs
+MEAS_TYPES = {
+    1: "weight_kg",
+    5: "fat_free_mass_kg",
+    6: "fat_ratio_pct",
+    8: "fat_mass_kg",
+    76: "muscle_mass_kg",
+    77: "hydration_kg",
+    88: "bone_mass_kg",
+}
+
+# In-memory token store (use env vars for initial refresh token)
+_tokens = {
+    "access_token": "",
+    "refresh_token": os.environ.get("WITHINGS_REFRESH_TOKEN", ""),
+    "expires_at": 0,
 }
 
 
-def _base_body(method: str) -> dict:
-    return {
-        "acceptLanguage": "en",
-        "accountID": "",
-        "appID": APP_ID,
-        "sourceAppID": APP_ID,
-        "clientInfo": "pyvesync",
-        "clientType": "vesyncApp",
-        "clientVersion": f"VeSync {APP_VERSION}",
-        "debugMode": False,
-        "method": method,
-        "osInfo": "Android",
-        "terminalId": TERMINAL_ID,
-        "timeZone": VESYNC_TIMEZONE,
-        "token": "",
-        "traceId": str(int(time.time())),
-        "userCountryCode": "US",
-    }
+def _refresh_access_token():
+    """Refresh the access token using the stored refresh token."""
+    if not _tokens["refresh_token"]:
+        return False
 
+    resp = requests.post(WITHINGS_TOKEN_URL, data={
+        "action": "requesttoken",
+        "grant_type": "refresh_token",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "refresh_token": _tokens["refresh_token"],
+    }, timeout=15)
 
-def vesync_login() -> dict:
-    password_md5 = hashlib.md5(VESYNC_PASSWORD.encode("utf-8")).hexdigest()
-
-    # Step 1: Get authorization code
-    body = _base_body("authByPWDOrOTM")
-    body["authProtocolType"] = "generic"
-    body["email"] = VESYNC_EMAIL
-    body["password"] = password_md5
-
-    resp = requests.post(
-        f"{API_BASE}/globalPlatform/api/accountAuth/v1/authByPWDOrOTM",
-        json=body, headers=HEADERS, timeout=15,
-    )
     data = resp.json()
-    if data.get("code") != 0:
-        return None
+    if data.get("status") != 0:
+        return False
 
-    auth_code = data.get("result", {}).get("authorizeCode")
-    if not auth_code:
-        return None
-
-    # Step 2: Exchange auth code for token
-    body2 = _base_body("loginByAuthorizeCode4Vesync")
-    body2["authorizeCode"] = auth_code
-    body2["emailSubscriptions"] = False
-
-    resp2 = requests.post(
-        f"{API_BASE}/user/api/accountManage/v1/loginByAuthorizeCode4Vesync",
-        json=body2, headers=HEADERS, timeout=15,
-    )
-    data2 = resp2.json()
-    if data2.get("code") != 0:
-        return None
-
-    result = data2.get("result", {})
-    return {"token": result.get("token"), "accountID": result.get("accountID")}
+    body = data["body"]
+    _tokens["access_token"] = body["access_token"]
+    _tokens["refresh_token"] = body["refresh_token"]
+    _tokens["expires_at"] = time.time() + body.get("expires_in", 10800)
+    return True
 
 
-def get_weight_data(token: str, account_id: str) -> list:
-    """Try the fat scale endpoint first, then fall back to basic scale endpoint."""
-    now = int(time.time())
-    auth_headers = {**HEADERS, "tk": token, "accountid": account_id}
-
-    # Try fat scale endpoint (ESF00+ / body composition scales)
-    body = _base_body("getWeighData")
-    body["token"] = token
-    body["accountID"] = account_id
-    body["startTime"] = 0
-    body["endTime"] = now
-    body["pageSize"] = 5
-    body["order"] = "desc"
-
-    resp = requests.post(
-        f"{API_BASE}/cloud/v1/deviceManaged/fatScale/getWeighData",
-        json=body, headers=auth_headers, timeout=15,
-    )
-    data = resp.json()
-    records = data.get("result", {}).get("data", [])
-    if records:
-        return records
-
-    # Fallback: basic scale endpoint
-    body["method"] = "getWeighingDataV2"
-    resp = requests.post(
-        f"{API_BASE}/cloud/v2/deviceManaged/getWeighingDataV2",
-        json=body, headers=auth_headers, timeout=15,
-    )
-    data = resp.json()
-    return data.get("result", {}).get("weightDatas", [])
+def _get_access_token() -> str:
+    """Return a valid access token, refreshing if needed."""
+    if _tokens["access_token"] and time.time() < _tokens["expires_at"] - 60:
+        return _tokens["access_token"]
+    if _refresh_access_token():
+        return _tokens["access_token"]
+    return ""
 
 
-def estimate_body_fat(weight_kg: float, impedance: float, height_cm: float, age: int, gender: str) -> float | None:
-    """Estimate body fat % from bioelectrical impedance using standard BIA formula."""
-    if not all([weight_kg, impedance, height_cm, age]):
-        return None
-    height_m = height_cm / 100.0
-    bmi = weight_kg / (height_m ** 2)
-    is_male = gender and gender.lower() in ("male", "m", "1")
-    sex_factor = 1 if is_male else 0
-    # Standard BIA-derived body fat estimation
-    body_fat = (1.20 * bmi) + (0.23 * age) - (10.8 * sex_factor) - 5.4
-    return round(max(0, min(body_fat, 70)), 1)
-
-
-@app.get("/latest_weight")
-def latest_weight():
-    if not VESYNC_EMAIL or not VESYNC_PASSWORD:
-        raise HTTPException(status_code=500, detail="VESYNC_EMAIL and VESYNC_PASSWORD must be set")
-
-    auth = vesync_login()
-    if not auth:
-        raise HTTPException(status_code=401, detail="VeSync login failed")
-
-    records = get_weight_data(auth["token"], auth["accountID"])
-    if not records:
-        raise HTTPException(status_code=404, detail="No weight data found")
-
-    latest = records[0]
-
-    # Fat scale fields
-    weight_kg = latest.get("weigh_kg")
-    weight_lb = latest.get("weigh_lb")
-    # Basic scale fallback
-    weight_g = latest.get("weightG")
-
-    if weight_kg:
-        weight = weight_kg
-        unit = "kg"
-        weight_lb = weight_lb or round(weight_kg * 2.20462, 2)
-    elif weight_g:
-        weight = weight_g
-        unit = "g"
-        weight_kg = weight_g / 1000.0
-        weight_lb = round(weight_kg * 2.20462, 2)
-    else:
-        weight = latest.get("weight", 0)
-        unit = latest.get("unit", "unknown")
-        weight_kg = None
-        weight_lb = None
-
-    # Body composition from impedance
-    impedance = latest.get("impedence") or latest.get("impedance")
-    height_cm = latest.get("heightCm")
-    age = latest.get("age")
-    gender = latest.get("gender")
-    body_fat_pct = estimate_body_fat(weight_kg, impedance, height_cm, age, gender) if impedance else None
-
-    timestamp = latest.get("timestamp")
-
-    response = {
-        "timestamp": timestamp,
-        "weight_kg": weight_kg,
-        "weight_lb": weight_lb,
-        "unit": latest.get("unit", unit),
-        "body_fat_pct": body_fat_pct,
-        "impedance": impedance,
-    }
-
-    # Include demographic context if present
-    if height_cm:
-        response["height_cm"] = height_cm
-    if age:
-        response["age"] = age
-    if gender:
-        response["gender"] = gender
-
-    return response
+def _parse_measure(value: int, unit: int) -> float:
+    """Convert Withings value/unit pair to float. Actual = value * 10^unit."""
+    return round(value * (10 ** unit), 2)
 
 
 @app.get("/", include_in_schema=False)
 def root():
-    from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/docs")
+
+
+@app.get("/auth")
+def auth():
+    """Redirect to Withings OAuth2 authorization page."""
+    if not CLIENT_ID or not REDIRECT_URI:
+        raise HTTPException(status_code=500, detail="WITHINGS_CLIENT_ID and WITHINGS_REDIRECT_URI must be set")
+    url = (
+        f"{WITHINGS_AUTH_URL}"
+        f"?response_type=code"
+        f"&client_id={CLIENT_ID}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&scope=user.metrics"
+        f"&state=withings-weight-api"
+    )
+    return RedirectResponse(url=url)
+
+
+@app.get("/callback")
+def callback(code: str = "", state: str = "", error: str = ""):
+    """OAuth2 callback — exchanges authorization code for tokens."""
+    if error:
+        raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
+    if not code:
+        raise HTTPException(status_code=400, detail="No authorization code received")
+
+    resp = requests.post(WITHINGS_TOKEN_URL, data={
+        "action": "requesttoken",
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+    }, timeout=15)
+
+    data = resp.json()
+    if data.get("status") != 0:
+        raise HTTPException(status_code=401, detail=f"Token exchange failed: {data}")
+
+    body = data["body"]
+    _tokens["access_token"] = body["access_token"]
+    _tokens["refresh_token"] = body["refresh_token"]
+    _tokens["expires_at"] = time.time() + body.get("expires_in", 10800)
+
+    return {
+        "status": "authenticated",
+        "message": "Save this refresh token as WITHINGS_REFRESH_TOKEN env var for persistence",
+        "refresh_token": body["refresh_token"],
+    }
+
+
+@app.get("/latest_weight")
+def latest_weight():
+    """Get the latest weight and body composition from Withings."""
+    access_token = _get_access_token()
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated. Visit /auth to connect your Withings account.")
+
+    meastypes = ",".join(str(t) for t in MEAS_TYPES.keys())
+
+    resp = requests.post(WITHINGS_MEASURE_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+    }, data={
+        "action": "getmeas",
+        "meastypes": meastypes,
+        "category": 1,
+    }, timeout=15)
+
+    data = resp.json()
+    if data.get("status") != 0:
+        # Token might be expired
+        if data.get("status") in (401, 403):
+            _tokens["access_token"] = ""
+            raise HTTPException(status_code=401, detail="Token expired. Visit /auth to re-authenticate.")
+        raise HTTPException(status_code=502, detail=f"Withings API error: {data}")
+
+    groups = data.get("body", {}).get("measuregrps", [])
+    if not groups:
+        raise HTTPException(status_code=404, detail="No measurements found")
+
+    # Latest measurement group (already sorted by most recent)
+    latest = groups[0]
+
+    response = {
+        "timestamp": latest.get("date"),
+        "device_id": latest.get("deviceid"),
+    }
+
+    for measure in latest.get("measures", []):
+        mtype = measure.get("type")
+        if mtype in MEAS_TYPES:
+            response[MEAS_TYPES[mtype]] = _parse_measure(measure["value"], measure["unit"])
+
+    # Add weight_lb if weight_kg present
+    if "weight_kg" in response:
+        response["weight_lb"] = round(response["weight_kg"] * 2.20462, 2)
+
+    return response
