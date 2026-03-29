@@ -178,6 +178,7 @@ def latest_weight():
     return response
 
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok", "docs": "/docs"}
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/docs")
