@@ -256,14 +256,16 @@ def api_latest():
 
 @app.get("/api/history")
 def api_history(days: int = 90):
-    """Get all measurements for the last N days."""
+    """Get the latest measurement per day for the last N days."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     with get_db() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM measurements WHERE measured_at >= %s ORDER BY measured_at ASC",
-                (cutoff,),
-            )
+            cur.execute("""
+                SELECT DISTINCT ON (measured_at::date) *
+                FROM measurements
+                WHERE measured_at >= %s
+                ORDER BY measured_at::date, measured_at DESC
+            """, (cutoff,))
             rows = cur.fetchall()
     for r in rows:
         r["measured_at"] = r["measured_at"].isoformat()
@@ -278,6 +280,12 @@ def api_weekly(weeks: int = 12):
     with get_db() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
+                WITH daily AS (
+                    SELECT DISTINCT ON (measured_at::date) *
+                    FROM measurements
+                    WHERE measured_at >= %s
+                    ORDER BY measured_at::date, measured_at DESC
+                )
                 SELECT
                     date_trunc('week', measured_at) AS week_start,
                     COUNT(*) AS measurement_count,
@@ -290,8 +298,7 @@ def api_weekly(weeks: int = 12):
                     ROUND(AVG(hydration_kg)::numeric, 2) AS avg_hydration_kg,
                     ROUND(MIN(weight_kg)::numeric, 2) AS min_weight_kg,
                     ROUND(MAX(weight_kg)::numeric, 2) AS max_weight_kg
-                FROM measurements
-                WHERE measured_at >= %s
+                FROM daily
                 GROUP BY week_start
                 ORDER BY week_start ASC
             """, (cutoff,))
