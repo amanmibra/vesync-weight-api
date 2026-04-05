@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Weight Tracker</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0f;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+        header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 32px; padding-bottom: 16px; border-bottom: 1px solid #1a1a2e;
+        }
+        h1 { font-size: 24px; font-weight: 600; color: #fff; }
+        .sync-btn {
+            background: #1a1a2e; border: 1px solid #2a2a4a; color: #8888cc;
+            padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px;
+            transition: all 0.2s;
+        }
+        .sync-btn:hover { background: #2a2a4a; color: #aaaaee; }
+        .sync-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Stats cards */
+        .stats-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 16px; margin-bottom: 32px;
+        }
+        .stat-card {
+            background: #12121e; border: 1px solid #1a1a2e; border-radius: 12px;
+            padding: 20px; text-align: center;
+        }
+        .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #666; margin-bottom: 8px; }
+        .stat-value { font-size: 28px; font-weight: 700; color: #fff; }
+        .stat-unit { font-size: 13px; color: #555; margin-left: 2px; }
+        .stat-delta { font-size: 12px; margin-top: 6px; }
+        .stat-delta.positive { color: #ff6b6b; }
+        .stat-delta.negative { color: #51cf66; }
+        .stat-delta.neutral { color: #555; }
+
+        /* Week over week */
+        .wow-section { margin-bottom: 32px; }
+        .wow-section h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #aaa; }
+        .wow-table {
+            width: 100%; border-collapse: collapse; background: #12121e;
+            border-radius: 12px; overflow: hidden; border: 1px solid #1a1a2e;
+        }
+        .wow-table th {
+            text-align: left; padding: 12px 16px; font-size: 11px;
+            text-transform: uppercase; letter-spacing: 1px; color: #555;
+            background: #0d0d18; border-bottom: 1px solid #1a1a2e;
+        }
+        .wow-table td {
+            padding: 12px 16px; font-size: 14px; border-bottom: 1px solid #1a1a2e;
+        }
+        .wow-table tr:last-child td { border-bottom: none; }
+        .wow-table tr:hover { background: #1a1a28; }
+        .delta-up { color: #ff6b6b; }
+        .delta-down { color: #51cf66; }
+        .delta-flat { color: #555; }
+
+        /* Charts */
+        .charts-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px;
+        }
+        @media (max-width: 768px) {
+            .charts-grid { grid-template-columns: 1fr; }
+        }
+        .chart-card {
+            background: #12121e; border: 1px solid #1a1a2e; border-radius: 12px;
+            padding: 20px;
+        }
+        .chart-card.full-width { grid-column: 1 / -1; }
+        .chart-card h3 { font-size: 14px; font-weight: 500; color: #888; margin-bottom: 16px; }
+        canvas { max-height: 300px; }
+
+        /* Loading / empty */
+        .loading { text-align: center; padding: 80px; color: #444; }
+        .empty-state {
+            text-align: center; padding: 80px; color: #444;
+        }
+        .empty-state a { color: #8888cc; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Weight Tracker</h1>
+            <button class="sync-btn" onclick="syncData()">Sync from Withings</button>
+        </header>
+
+        <div id="content">
+            <div class="loading">Loading...</div>
+        </div>
+    </div>
+
+    <script>
+        const METRIC_LABELS = {
+            weight_kg: 'Weight',
+            weight_lb: 'Weight',
+            fat_ratio_pct: 'Body Fat',
+            muscle_mass_kg: 'Muscle',
+            fat_mass_kg: 'Fat Mass',
+            bone_mass_kg: 'Bone Mass',
+            hydration_kg: 'Hydration',
+        };
+
+        const chartInstances = {};
+
+        function fmt(v, decimals = 1) {
+            return v != null ? Number(v).toFixed(decimals) : '—';
+        }
+
+        function deltaStr(curr, prev, unit, invert = false) {
+            if (curr == null || prev == null) return '<span class="delta-flat">—</span>';
+            const d = curr - prev;
+            const sign = d > 0 ? '+' : '';
+            // For weight/fat: up is bad (red), down is good (green). invert for muscle.
+            let cls = 'delta-flat';
+            if (Math.abs(d) > 0.05) {
+                if (invert) cls = d > 0 ? 'delta-down' : 'delta-up';
+                else cls = d > 0 ? 'delta-up' : 'delta-down';
+            }
+            return `<span class="${cls}">${sign}${d.toFixed(1)}${unit}</span>`;
+        }
+
+        function weekLabel(isoDate) {
+            const d = new Date(isoDate);
+            return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        }
+
+        function createChart(canvasId, label, data, color, yUnit = '') {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return;
+            if (chartInstances[canvasId]) chartInstances[canvasId].destroy();
+            chartInstances[canvasId] = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.map(d => d.x),
+                    datasets: [{
+                        label: label,
+                        data: data.map(d => d.y),
+                        borderColor: color,
+                        backgroundColor: color + '18',
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 3,
+                        pointHoverRadius: 6,
+                        borderWidth: 2,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => `${ctx.parsed.y}${yUnit}`
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: { unit: 'day', tooltipFormat: 'MMM d, yyyy' },
+                            grid: { color: '#1a1a2e' },
+                            ticks: { color: '#444', maxTicksLimit: 8 },
+                        },
+                        y: {
+                            grid: { color: '#1a1a2e' },
+                            ticks: { color: '#444', callback: v => v + yUnit },
+                        }
+                    }
+                }
+            });
+        }
+
+        async function loadData() {
+            try {
+                const [historyRes, weeklyRes] = await Promise.all([
+                    fetch('/api/history?days=90'),
+                    fetch('/api/weekly?weeks=12'),
+                ]);
+
+                if (!historyRes.ok && historyRes.status === 404) {
+                    document.getElementById('content').innerHTML = `
+                        <div class="empty-state">
+                            <p>No measurements yet.</p>
+                            <p style="margin-top:12px">
+                                <a href="/api/sync" onclick="event.preventDefault();syncData()">Sync from Withings</a>
+                                to pull in your data.
+                            </p>
+                        </div>`;
+                    return;
+                }
+
+                const history = await historyRes.json();
+                const weekly = await weeklyRes.json();
+
+                render(history, weekly);
+            } catch (e) {
+                document.getElementById('content').innerHTML =
+                    `<div class="empty-state">Error loading data: ${e.message}</div>`;
+            }
+        }
+
+        function render(history, weekly) {
+            if (!history.length) {
+                document.getElementById('content').innerHTML = `
+                    <div class="empty-state">
+                        <p>No measurements yet. <a href="#" onclick="event.preventDefault();syncData()">Sync from Withings</a></p>
+                    </div>`;
+                return;
+            }
+
+            const latest = history[history.length - 1];
+            const prev = history.length > 1 ? history[history.length - 2] : null;
+
+            // Current week and last week from weekly data
+            const thisWeek = weekly.length ? weekly[weekly.length - 1] : null;
+            const lastWeek = weekly.length > 1 ? weekly[weekly.length - 2] : null;
+
+            let html = '';
+
+            // --- Stat cards ---
+            html += '<div class="stats-grid">';
+            html += statCard('Weight', latest.weight_lb, 'lb',
+                prev ? latest.weight_lb - prev.weight_lb : null, false);
+            html += statCard('Body Fat', latest.fat_ratio_pct, '%',
+                prev ? latest.fat_ratio_pct - prev.fat_ratio_pct : null, false);
+            html += statCard('Muscle', latest.muscle_mass_kg, 'kg',
+                prev ? latest.muscle_mass_kg - prev.muscle_mass_kg : null, true);
+            html += statCard('Fat Mass', latest.fat_mass_kg, 'kg',
+                prev ? latest.fat_mass_kg - prev.fat_mass_kg : null, false);
+            html += statCard('Bone Mass', latest.bone_mass_kg, 'kg',
+                prev ? latest.bone_mass_kg - prev.bone_mass_kg : null, true);
+            html += statCard('Hydration', latest.hydration_kg, 'kg',
+                prev ? latest.hydration_kg - prev.hydration_kg : null, true);
+            html += '</div>';
+
+            // --- Charts ---
+            html += '<div class="charts-grid">';
+            html += '<div class="chart-card full-width"><h3>Weight (lb)</h3><canvas id="chart-weight"></canvas></div>';
+            html += '<div class="chart-card"><h3>Body Fat %</h3><canvas id="chart-fat"></canvas></div>';
+            html += '<div class="chart-card"><h3>Muscle Mass (kg)</h3><canvas id="chart-muscle"></canvas></div>';
+            html += '</div>';
+
+            // --- Week over week table ---
+            if (weekly.length) {
+                html += '<div class="wow-section"><h2>Week over Week</h2>';
+                html += '<div style="overflow-x:auto">';
+                html += '<table class="wow-table">';
+                html += '<thead><tr>';
+                html += '<th>Week</th><th>Weigh-ins</th><th>Avg Weight</th><th>Change</th>';
+                html += '<th>Avg Body Fat</th><th>Change</th>';
+                html += '<th>Avg Muscle</th><th>Change</th>';
+                html += '</tr></thead><tbody>';
+                for (let i = weekly.length - 1; i >= 0; i--) {
+                    const w = weekly[i];
+                    const p = i > 0 ? weekly[i - 1] : null;
+                    html += '<tr>';
+                    html += `<td>${weekLabel(w.week_start)}</td>`;
+                    html += `<td>${w.measurement_count}</td>`;
+                    html += `<td>${fmt(w.avg_weight_lb)} lb</td>`;
+                    html += `<td>${deltaStr(w.avg_weight_lb, p?.avg_weight_lb, ' lb')}</td>`;
+                    html += `<td>${fmt(w.avg_fat_ratio_pct)}%</td>`;
+                    html += `<td>${deltaStr(w.avg_fat_ratio_pct, p?.avg_fat_ratio_pct, '%')}</td>`;
+                    html += `<td>${fmt(w.avg_muscle_mass_kg)} kg</td>`;
+                    html += `<td>${deltaStr(w.avg_muscle_mass_kg, p?.avg_muscle_mass_kg, ' kg', true)}</td>`;
+                    html += '</tr>';
+                }
+                html += '</tbody></table></div></div>';
+            }
+
+            document.getElementById('content').innerHTML = html;
+
+            // Render charts
+            const weightData = history.filter(h => h.weight_lb).map(h => ({
+                x: new Date(h.measured_at), y: h.weight_lb
+            }));
+            const fatData = history.filter(h => h.fat_ratio_pct).map(h => ({
+                x: new Date(h.measured_at), y: h.fat_ratio_pct
+            }));
+            const muscleData = history.filter(h => h.muscle_mass_kg).map(h => ({
+                x: new Date(h.measured_at), y: h.muscle_mass_kg
+            }));
+
+            createChart('chart-weight', 'Weight', weightData, '#6c8aff', ' lb');
+            createChart('chart-fat', 'Body Fat', fatData, '#ff6b6b', '%');
+            createChart('chart-muscle', 'Muscle', muscleData, '#51cf66', ' kg');
+        }
+
+        function statCard(label, value, unit, delta, invert) {
+            let deltaHtml = '';
+            if (delta != null) {
+                const sign = delta > 0 ? '+' : '';
+                let cls = 'neutral';
+                if (Math.abs(delta) > 0.05) {
+                    if (invert) cls = delta > 0 ? 'negative' : 'positive';
+                    else cls = delta > 0 ? 'positive' : 'negative';
+                }
+                deltaHtml = `<div class="stat-delta ${cls}">${sign}${delta.toFixed(1)}${unit} from last</div>`;
+            }
+            return `
+                <div class="stat-card">
+                    <div class="stat-label">${label}</div>
+                    <div class="stat-value">${fmt(value)}<span class="stat-unit">${unit}</span></div>
+                    ${deltaHtml}
+                </div>`;
+        }
+
+        async function syncData() {
+            const btn = document.querySelector('.sync-btn');
+            btn.disabled = true;
+            btn.textContent = 'Syncing...';
+            try {
+                const res = await fetch('/api/sync', { method: 'POST' });
+                const data = await res.json();
+                btn.textContent = `Synced ${data.synced} records`;
+                await loadData();
+            } catch (e) {
+                btn.textContent = 'Sync failed';
+            }
+            setTimeout(() => {
+                btn.textContent = 'Sync from Withings';
+                btn.disabled = false;
+            }, 3000);
+        }
+
+        loadData();
+    </script>
+</body>
+</html>
