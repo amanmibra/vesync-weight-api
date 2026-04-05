@@ -163,7 +163,7 @@
                         legend: { display: false },
                         tooltip: {
                             callbacks: {
-                                label: (ctx) => `${ctx.parsed.y}${yUnit}`
+                                label: (ctx) => `${Number(ctx.parsed.y).toFixed(1)}${yUnit}`
                             }
                         }
                     },
@@ -176,7 +176,7 @@
                         },
                         y: {
                             grid: { color: '#1a1a2e' },
-                            ticks: { color: '#444', callback: v => v + yUnit },
+                            ticks: { color: '#444', callback: v => Number(v).toFixed(1) + yUnit },
                         }
                     }
                 }
