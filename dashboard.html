@@ -114,6 +114,9 @@
 
         const chartInstances = {};
 
+        const KG_TO_LB = 2.20462;
+        function toLb(kg) { return kg != null ? +(kg * KG_TO_LB).toFixed(1) : null; }
+
         function fmt(v, decimals = 1) {
             return v != null ? Number(v).toFixed(decimals) : '—';
         }
@@ -236,21 +239,21 @@
                 prev ? latest.weight_lb - prev.weight_lb : null, false);
             html += statCard('Body Fat', latest.fat_ratio_pct, '%',
                 prev ? latest.fat_ratio_pct - prev.fat_ratio_pct : null, false);
-            html += statCard('Muscle', latest.muscle_mass_kg, 'kg',
-                prev ? latest.muscle_mass_kg - prev.muscle_mass_kg : null, true);
-            html += statCard('Fat Mass', latest.fat_mass_kg, 'kg',
-                prev ? latest.fat_mass_kg - prev.fat_mass_kg : null, false);
-            html += statCard('Bone Mass', latest.bone_mass_kg, 'kg',
-                prev ? latest.bone_mass_kg - prev.bone_mass_kg : null, true);
-            html += statCard('Hydration', latest.hydration_kg, 'kg',
-                prev ? latest.hydration_kg - prev.hydration_kg : null, true);
+            html += statCard('Muscle', toLb(latest.muscle_mass_kg), 'lb',
+                prev ? toLb(latest.muscle_mass_kg) - toLb(prev.muscle_mass_kg) : null, true);
+            html += statCard('Fat Mass', toLb(latest.fat_mass_kg), 'lb',
+                prev ? toLb(latest.fat_mass_kg) - toLb(prev.fat_mass_kg) : null, false);
+            html += statCard('Bone Mass', toLb(latest.bone_mass_kg), 'lb',
+                prev ? toLb(latest.bone_mass_kg) - toLb(prev.bone_mass_kg) : null, true);
+            html += statCard('Hydration', toLb(latest.hydration_kg), 'lb',
+                prev ? toLb(latest.hydration_kg) - toLb(prev.hydration_kg) : null, true);
             html += '</div>';
 
             // --- Charts ---
             html += '<div class="charts-grid">';
             html += '<div class="chart-card full-width"><h3>Weight (lb)</h3><canvas id="chart-weight"></canvas></div>';
             html += '<div class="chart-card"><h3>Body Fat %</h3><canvas id="chart-fat"></canvas></div>';
-            html += '<div class="chart-card"><h3>Muscle Mass (kg)</h3><canvas id="chart-muscle"></canvas></div>';
+            html += '<div class="chart-card"><h3>Muscle Mass (lb)</h3><canvas id="chart-muscle"></canvas></div>';
             html += '</div>';
 
             // --- Week over week table ---
@@ -273,8 +276,8 @@
                     html += `<td>${deltaStr(w.avg_weight_lb, p?.avg_weight_lb, ' lb')}</td>`;
                     html += `<td>${fmt(w.avg_fat_ratio_pct)}%</td>`;
                     html += `<td>${deltaStr(w.avg_fat_ratio_pct, p?.avg_fat_ratio_pct, '%')}</td>`;
-                    html += `<td>${fmt(w.avg_muscle_mass_kg)} kg</td>`;
-                    html += `<td>${deltaStr(w.avg_muscle_mass_kg, p?.avg_muscle_mass_kg, ' kg', true)}</td>`;
+                    html += `<td>${fmt(toLb(w.avg_muscle_mass_kg))} lb</td>`;
+                    html += `<td>${deltaStr(toLb(w.avg_muscle_mass_kg), toLb(p?.avg_muscle_mass_kg), ' lb', true)}</td>`;
                     html += '</tr>';
                 }
                 html += '</tbody></table></div></div>';
@@ -290,12 +293,12 @@
                 x: new Date(h.measured_at), y: h.fat_ratio_pct
             }));
             const muscleData = history.filter(h => h.muscle_mass_kg).map(h => ({
-                x: new Date(h.measured_at), y: h.muscle_mass_kg
+                x: new Date(h.measured_at), y: toLb(h.muscle_mass_kg)
             }));
 
             createChart('chart-weight', 'Weight', weightData, '#6c8aff', ' lb');
             createChart('chart-fat', 'Body Fat', fatData, '#ff6b6b', '%');
-            createChart('chart-muscle', 'Muscle', muscleData, '#51cf66', ' kg');
+            createChart('chart-muscle', 'Muscle', muscleData, '#51cf66', ' lb');
         }
 
         function statCard(label, value, unit, delta, invert) {
