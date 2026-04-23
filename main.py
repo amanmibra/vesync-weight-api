@@ -70,6 +70,35 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_measurements_measured_at
                 ON measurements(measured_at DESC)
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS withings_auth (
+                    id INT PRIMARY KEY DEFAULT 1,
+                    refresh_token TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    CHECK (id = 1)
+                )
+            """)
+        conn.commit()
+
+
+def _load_refresh_token() -> str:
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT refresh_token FROM withings_auth WHERE id = 1")
+            row = cur.fetchone()
+    return row[0] if row else ""
+
+
+def _save_refresh_token(token: str):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO withings_auth (id, refresh_token, updated_at)
+                VALUES (1, %s, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET refresh_token = EXCLUDED.refresh_token,
+                    updated_at = NOW()
+            """, (token,))
         conn.commit()
 
 
@@ -91,8 +120,13 @@ def store_measurement(data: dict):
 # --- Withings API ---
 
 
+class WithingsAuthError(Exception):
+    """Raised when Withings authentication fails and re-auth is required."""
+
+
 def _refresh_access_token():
     if not _tokens["refresh_token"]:
+        print("[auth] No refresh token available")
         return False
     resp = requests.post(WITHINGS_TOKEN_URL, data={
         "action": "requesttoken",
@@ -103,11 +137,16 @@ def _refresh_access_token():
     }, timeout=15)
     data = resp.json()
     if data.get("status") != 0:
+        print(f"[auth] Token refresh failed: {data}")
         return False
     body = data["body"]
     _tokens["access_token"] = body["access_token"]
     _tokens["refresh_token"] = body["refresh_token"]
     _tokens["expires_at"] = time.time() + body.get("expires_in", 10800)
+    try:
+        _save_refresh_token(body["refresh_token"])
+    except Exception as e:
+        print(f"[auth] Failed to persist refresh token: {e}")
     return True
 
 
@@ -116,7 +155,7 @@ def _get_access_token() -> str:
         return _tokens["access_token"]
     if _refresh_access_token():
         return _tokens["access_token"]
-    return ""
+    raise WithingsAuthError("Withings authentication expired — visit /auth to re-authenticate")
 
 
 def _parse_measure(value: int, unit: int) -> float:
@@ -124,10 +163,9 @@ def _parse_measure(value: int, unit: int) -> float:
 
 
 def fetch_withings_measurements(startdate: int = 0, enddate: int = 0) -> list[dict]:
-    """Fetch measurements from Withings API and return parsed list."""
+    """Fetch measurements from Withings API and return parsed list.
+    Raises WithingsAuthError if the refresh token is invalid."""
     access_token = _get_access_token()
-    if not access_token:
-        return []
 
     meastypes = ",".join(str(t) for t in MEAS_TYPES.keys())
     params = {"action": "getmeas", "meastypes": meastypes, "category": 1}
@@ -141,6 +179,9 @@ def fetch_withings_measurements(startdate: int = 0, enddate: int = 0) -> list[di
     }, data=params, timeout=15)
 
     data = resp.json()
+    if data.get("status") in (401, 403):
+        _tokens["access_token"] = ""
+        raise WithingsAuthError(f"Withings API auth error: {data}")
     if data.get("status") != 0:
         return []
 
@@ -163,14 +204,47 @@ def fetch_withings_measurements(startdate: int = 0, enddate: int = 0) -> list[di
     return results
 
 
-def daily_sync():
-    """Cron job: fetch today's measurements and store them."""
+def _latest_measured_at_ts() -> int | None:
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(measured_at) FROM measurements")
+            row = cur.fetchone()
+    if not row or not row[0]:
+        return None
+    return int(row[0].timestamp())
+
+
+def _dedup_latest_per_day(measurements: list[dict]) -> list[dict]:
+    """Keep only the most recent measurement per local-TZ calendar day."""
+    by_date: dict = {}
+    for m in measurements:
+        day = m["measured_at"].astimezone(TZ).date()
+        if day not in by_date or m["measured_at"] > by_date[day]["measured_at"]:
+            by_date[day] = m
+    return list(by_date.values())
+
+
+def sync_measurements() -> int:
+    """Incrementally fetch measurements since the latest stored one, keeping
+    the most recent measurement per day, and write them to the DB."""
     now = int(time.time())
-    start = now - 86400  # last 24 hours
+    last_ts = _latest_measured_at_ts()
+    # Start just after the latest stored measurement; fall back to 30 days.
+    start = (last_ts + 1) if last_ts else (now - 30 * 86400)
     measurements = fetch_withings_measurements(startdate=start, enddate=now)
+    measurements = _dedup_latest_per_day(measurements)
     for m in measurements:
         store_measurement(m)
-    print(f"[cron] Synced {len(measurements)} measurements at {datetime.now(TZ)}")
+    return len(measurements)
+
+
+def daily_sync():
+    """Cron job wrapper around sync_measurements with logging."""
+    try:
+        count = sync_measurements()
+        print(f"[cron] Synced {count} measurements at {datetime.now(TZ)}")
+    except WithingsAuthError as e:
+        print(f"[cron] Auth expired ({e}) — user must visit /auth to re-authenticate")
 
 
 # --- App lifecycle ---
@@ -182,6 +256,17 @@ scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
 async def lifespan(app: FastAPI):
     if DATABASE_URL:
         init_db()
+        try:
+            db_token = _load_refresh_token()
+            if db_token:
+                _tokens["refresh_token"] = db_token
+                print("[auth] Loaded refresh token from DB")
+        except Exception as e:
+            print(f"[auth] Failed to load refresh token from DB: {e}")
+        try:
+            daily_sync()
+        except Exception as e:
+            print(f"[startup] Initial sync failed: {e}")
     # Run daily at 11 PM PT
     scheduler.add_job(daily_sync, "cron", hour=23, minute=0)
     scheduler.start()
@@ -231,6 +316,10 @@ def callback(code: str = "", state: str = "", error: str = ""):
     _tokens["access_token"] = body["access_token"]
     _tokens["refresh_token"] = body["refresh_token"]
     _tokens["expires_at"] = time.time() + body.get("expires_in", 10800)
+    try:
+        _save_refresh_token(body["refresh_token"])
+    except Exception as e:
+        print(f"[auth] Failed to persist refresh token: {e}")
     return {
         "status": "authenticated",
         "message": "Save this refresh token as WITHINGS_REFRESH_TOKEN env var for persistence",
@@ -310,18 +399,23 @@ def api_weekly(weeks: int = 12):
 
 @app.post("/api/sync")
 def api_sync():
-    """Manually trigger a sync from Withings API to database."""
-    measurements = fetch_withings_measurements()
-    for m in measurements:
-        store_measurement(m)
-    return {"synced": len(measurements)}
+    """Manually trigger an incremental sync from Withings API to database."""
+    try:
+        return {"synced": sync_measurements()}
+    except WithingsAuthError:
+        raise HTTPException(status_code=401, detail={
+            "auth_required": True,
+            "auth_url": "/auth",
+            "message": "Withings authentication expired. Re-authenticate to continue syncing.",
+        })
 
 
 @app.get("/latest_weight")
 def latest_weight():
     """Get the latest weight directly from Withings (live, not from DB)."""
-    access_token = _get_access_token()
-    if not access_token:
+    try:
+        access_token = _get_access_token()
+    except WithingsAuthError:
         raise HTTPException(status_code=401, detail="Not authenticated. Visit /auth to connect.")
 
     meastypes = ",".join(str(t) for t in MEAS_TYPES.keys())

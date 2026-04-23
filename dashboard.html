@@ -23,10 +23,36 @@
         .sync-btn {
             background: #1a1a2e; border: 1px solid #2a2a4a; color: #8888cc;
             padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px;
-            transition: all 0.2s;
+            transition: all 0.2s; text-decoration: none; display: inline-block;
         }
         .sync-btn:hover { background: #2a2a4a; color: #aaaaee; }
         .sync-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .sync-btn.reauth {
+            background: #3a1a1a; border-color: #6a2a2a; color: #ff8888;
+        }
+        .sync-btn.reauth:hover { background: #4a2020; color: #ffaaaa; }
+
+        /* Auth banner */
+        .auth-banner {
+            background: #3a1a1a; border: 1px solid #6a2a2a; color: #ffaaaa;
+            border-radius: 12px; padding: 14px 20px; margin-bottom: 24px;
+            display: flex; justify-content: space-between; align-items: center; gap: 16px;
+        }
+        .auth-banner a {
+            background: #ff6b6b; color: #1a0a0a; text-decoration: none;
+            padding: 8px 16px; border-radius: 8px; font-weight: 600; font-size: 13px;
+            white-space: nowrap;
+        }
+        .auth-banner a:hover { background: #ff8a8a; }
+        .auth-banner-text { font-size: 14px; }
+        .auth-banner-text strong { color: #ffdddd; }
+
+        /* Stale data warning */
+        .stale-banner {
+            background: #2a2315; border: 1px solid #5a4a25; color: #e0c080;
+            border-radius: 12px; padding: 10px 16px; margin-bottom: 24px;
+            font-size: 13px;
+        }
 
         /* Stats cards */
         .stats-grid {
@@ -93,8 +119,10 @@
     <div class="container">
         <header>
             <h1>Weight Tracker</h1>
-            <button class="sync-btn" onclick="syncData()">Sync from Withings</button>
+            <span id="sync-action"><button class="sync-btn" onclick="syncData()">Sync from Withings</button></span>
         </header>
+
+        <div id="banners"></div>
 
         <div id="content">
             <div class="loading">Loading...</div>
@@ -227,6 +255,9 @@
             const latest = history[history.length - 1];
             const prev = history.length > 1 ? history[history.length - 2] : null;
 
+            document.getElementById('banners').innerHTML = '';
+            showStaleBanner(latest.measured_at);
+
             // Current week and last week from weekly data
             const thisWeek = weekly.length ? weekly[weekly.length - 1] : null;
             const lastWeek = weekly.length > 1 ? weekly[weekly.length - 2] : null;
@@ -320,12 +351,39 @@
                 </div>`;
         }
 
+        function showAuthBanner() {
+            document.getElementById('banners').innerHTML = `
+                <div class="auth-banner">
+                    <div class="auth-banner-text">
+                        <strong>Withings sign-in expired.</strong>
+                        New weigh-ins can't sync until you re-authenticate.
+                    </div>
+                    <a href="/auth">Re-authenticate</a>
+                </div>`;
+            document.getElementById('sync-action').innerHTML =
+                `<a class="sync-btn reauth" href="/auth">Re-authenticate with Withings</a>`;
+        }
+
+        function showStaleBanner(latestIso) {
+            const days = Math.floor((Date.now() - new Date(latestIso)) / 86400000);
+            if (days < 2) return;
+            const el = document.createElement('div');
+            el.className = 'stale-banner';
+            el.textContent = `Latest weigh-in is ${days} days old. Try syncing — if that fails, you may need to re-authenticate.`;
+            document.getElementById('banners').appendChild(el);
+        }
+
         async function syncData() {
             const btn = document.querySelector('.sync-btn');
+            if (!btn) return;
             btn.disabled = true;
             btn.textContent = 'Syncing...';
             try {
                 const res = await fetch('/api/sync', { method: 'POST' });
+                if (res.status === 401) {
+                    showAuthBanner();
+                    return;
+                }
                 const data = await res.json();
                 btn.textContent = `Synced ${data.synced} records`;
                 await loadData();
@@ -333,8 +391,11 @@
                 btn.textContent = 'Sync failed';
             }
             setTimeout(() => {
-                btn.textContent = 'Sync from Withings';
-                btn.disabled = false;
+                const b = document.querySelector('.sync-btn');
+                if (b && !b.classList.contains('reauth')) {
+                    b.textContent = 'Sync from Withings';
+                    b.disabled = false;
+                }
             }, 3000);
         }
 
