@@ -320,11 +320,7 @@ def callback(code: str = "", state: str = "", error: str = ""):
         _save_refresh_token(body["refresh_token"])
     except Exception as e:
         print(f"[auth] Failed to persist refresh token: {e}")
-    return {
-        "status": "authenticated",
-        "message": "Save this refresh token as WITHINGS_REFRESH_TOKEN env var for persistence",
-        "refresh_token": body["refresh_token"],
-    }
+    return RedirectResponse(url="/", status_code=303)
 
 
 # --- API endpoints ---
@@ -395,6 +391,19 @@ def api_weekly(weeks: int = 12):
     for r in rows:
         r["week_start"] = r["week_start"].isoformat()
     return rows
+
+
+@app.get("/api/auth/check")
+def api_auth_check():
+    """Lightweight check: returns 200 if Withings auth is usable, 401 otherwise."""
+    try:
+        _get_access_token()
+        return {"authenticated": True}
+    except WithingsAuthError:
+        raise HTTPException(status_code=401, detail={
+            "auth_required": True,
+            "auth_url": "/auth",
+        })
 
 
 @app.post("/api/sync")
